@@ -1,20 +1,26 @@
 [
   {
     "character_a": "林默",
-    "character_b": "林正",
-    "relation": "",
+    "character_b": "赵铁",
+    "relation": "从服从转为违抗",
     "chapter": 1
   },
   {
     "character_a": "林默",
-    "character_b": "苏青",
-    "relation": "",
+    "character_b": "苏瑶",
+    "relation": "从依赖转为共同承担秘密风险",
+    "chapter": 3
+  },
+  {
+    "character_a": "林默",
+    "character_b": "铁背熊妖",
+    "relation": "从敌对转为单方面臣服",
     "chapter": 1
   },
   {
-    "character_a": "",
-    "character_b": "",
-    "relation": "",
-    "chapter": 6
+    "character_a": "林默",
+    "character_b": "赵刚",
+    "relation": "从被动躲避转为正面决裂",
+    "chapter": 3
   }
 ]

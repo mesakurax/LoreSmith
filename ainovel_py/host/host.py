@@ -153,7 +153,7 @@ class Host:
             style=self.cfg.style,
             runtime_state=self.lifecycle,
             status_label=self._derive_status_label(progress),
-            backend="llm",
+            backend=f"llm/{self.cfg.orchestrator}",
             context_window=self.cfg.context_window,
         )
         if progress:
@@ -193,7 +193,7 @@ class Host:
             snap.context_tokens = approx_tokens
             if self.cfg.context_window > 0:
                 snap.context_percent = round((approx_tokens / self.cfg.context_window) * 100, 2)
-        snap.agent_status = ["coordinator: ready", "backend: llm"]
+        snap.agent_status = ["coordinator: ready", f"backend: llm/{self.cfg.orchestrator}"]
         return snap
 
     def _derive_status_label(self, progress) -> str:

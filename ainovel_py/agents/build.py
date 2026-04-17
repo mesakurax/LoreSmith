@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ainovel_py.agents.orchestrator.imperative_adapter import ImperativeOrchestrator
 from ainovel_py.agents.runner import AgentRunner, CoordinatorLoop, LLMCoordinatorBackend
 from ainovel_py.bootstrap.config import Config
 from ainovel_py.store.store import Store
@@ -40,5 +41,10 @@ def build_coordinator_loop(
     emit_stream,
 ) -> CoordinatorLoop:
     runner = AgentRunner(build_tool_registry(store))
-    impl = LLMCoordinatorBackend(cfg, runner, store, emit_event, emit_stream)
+    if cfg.orchestrator == "langgraph":
+        from ainovel_py.agents.orchestrator.langgraph.core import LangGraphRuntime
+
+        impl = LangGraphRuntime(cfg, runner, store, emit_event, emit_stream)
+    else:
+        impl = ImperativeOrchestrator(LLMCoordinatorBackend(cfg, runner, store, emit_event, emit_stream))
     return CoordinatorLoop(impl)

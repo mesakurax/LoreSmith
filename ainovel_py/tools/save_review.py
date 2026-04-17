@@ -59,8 +59,12 @@ class SaveReviewTool:
         hints.extend(normalization_hints)
         progress = self.store.progress.load()
         if final_verdict in {"rewrite", "polish"}:
-            affected = list(review.affected_chapters)
-            if not affected and review.chapter > 0:
+            completed = set(progress.completed_chapters) if progress else set()
+            affected = [ch for ch in review.affected_chapters if ch in completed]
+            dropped = [ch for ch in review.affected_chapters if ch not in completed]
+            if dropped:
+                hints.append(f"[系统] review_filtered: 未完成章节不会进入重写队列 {dropped}。")
+            if not affected and review.chapter > 0 and review.chapter in completed:
                 affected = [review.chapter]
             flow = FlowState.REWRITING
             verb = "重写"
