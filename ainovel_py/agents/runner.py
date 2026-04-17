@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Callable
 
+from ainovel_py.agents.hints import has_placeholder_action
+from ainovel_py.agents.longform import run_longform_hint_actions
+from ainovel_py.agents.post_commit import plan_post_commit, plan_review_followup
+from ainovel_py.agents.review_flow import save_arc_summary_followup, save_volume_summary_followup
 from ainovel_py.domain.runtime import FlowState, infer_planning_tier, normalize_planning_tier
 
 from ainovel_py.agents.context_manager import ContextManager
 from ainovel_py.agents.llm_client import OpenAICompatClient
-from ainovel_py.assets import load_bundle, select_architect_prompt
+from ainovel_py.agents.orchestrator.interface import OrchestratorBackend
+from ainovel_py.assets import load_bundle
 from ainovel_py.bootstrap.config import Config
 from ainovel_py.host.events import Event
 
@@ -23,29 +27,6 @@ class AgentRunner:
         if tool is None:
             raise ValueError(f"tool not found: {name}")
         return tool.execute(args)
-
-
-class CoordinatorBackend(Protocol):
-    def start(self, prompt: str) -> None: ...
-    def resume(self, prompt: str) -> None: ...
-    def follow_up(self, text: str) -> None: ...
-    def abort(self) -> None: ...
-    def wait_idle(self) -> None: ...
-
-
-class HintAction(str, Enum):
-    CONTINUE = "continue"
-    REVIEW_REQUIRED = "review_required"
-    REWRITE_REQUIRED = "rewrite_required"
-    POLISH_REQUIRED = "polish_required"
-    REWRITE_DONE = "rewrite_done"
-    WRITER_FEEDBACK = "writer_feedback"
-    ARC_END = "arc_end"
-    BOOK_COMPLETE = "book_complete"
-    NEW_VOLUME_REQUIRED = "new_volume_required"
-    EXPAND_ARC_REQUIRED = "expand_arc_required"
-    REVIEW_ACCEPTED = "review_accepted"
-    UNKNOWN = "unknown"
 
 
 class LLMCoordinatorBackend:
@@ -132,19 +113,18 @@ class LLMCoordinatorBackend:
                 review_chapter = pending_review_for
                 review_result = _run_review_summary(client, self.runner, self.emit_event, review_chapter, out_lines)
                 pending_review_for = None
-                hints = review_result.get("system_hints") or []
-                actions = _parse_hint_actions(hints)
-                if hints:
-                    out_lines.append("[hints] " + " | ".join(hints))
-                if _has_placeholder_action(actions):
-                    _run_longform_hint_actions(
+                plan = plan_review_followup(review_result)
+                if plan.hints:
+                    out_lines.append("[hints] " + " | ".join(plan.hints))
+                if has_placeholder_action(plan.actions):
+                    run_longform_hint_actions(
                         client,
                         self.runner,
                         self.emit_event,
                         self.assets,
                         self._effective_planning_tier(),
                         review_chapter,
-                        actions,
+                        plan.actions,
                         out_lines,
                     )
                 steps += 1
@@ -179,15 +159,14 @@ class LLMCoordinatorBackend:
             out_lines.append(f"[tool] draft_chapter -> word_count={draft_res.get('word_count', 0)}")
             out_lines.append(f"[tool] commit_chapter -> next={commit_res.get('next_chapter', chapter + 1)}")
 
-            hints = commit_res.get("system_hints") or []
-            actions = _parse_hint_actions(hints)
-            if _needs_review_from_actions(commit_res, actions):
-                pending_review_for = chapter
+            plan = plan_post_commit(commit_res, chapter)
+            if plan.pending_review_for is not None:
+                pending_review_for = plan.pending_review_for
             else:
-                if hints:
-                    out_lines.append("[hints] " + " | ".join(hints))
-                if _has_placeholder_action(actions):
-                    out_lines.append("[hint-actions] " + ", ".join(a.value for a in actions))
+                if plan.hints:
+                    out_lines.append("[hints] " + " | ".join(plan.hints))
+                if has_placeholder_action(plan.actions):
+                    out_lines.append("[hint-actions] " + ", ".join(a.value for a in plan.actions))
             steps += 1
 
         self.emit_stream("content", "\n".join(out_lines) + "\n")
@@ -464,118 +443,6 @@ def _extract_commit_metadata(client: OpenAICompatClient, chapter: int, draft: st
     return data
 
 
-def _parse_hint_actions(hints: list[str]) -> list[HintAction]:
-    actions: list[HintAction] = []
-    for hint in hints:
-        lower = hint.lower()
-        if "review_required" in lower:
-            actions.append(HintAction.REVIEW_REQUIRED)
-        elif "review_accepted" in lower:
-            actions.append(HintAction.REVIEW_ACCEPTED)
-        elif "rewrite_required" in lower or "重写_required" in lower:
-            actions.append(HintAction.REWRITE_REQUIRED)
-        elif "polish_required" in lower or "打磨_required" in lower:
-            actions.append(HintAction.POLISH_REQUIRED)
-        elif "writer_feedback" in lower:
-            actions.append(HintAction.WRITER_FEEDBACK)
-        elif "continue:" in lower or "continue" in lower:
-            actions.append(HintAction.CONTINUE)
-        elif "arc_end" in lower:
-            actions.append(HintAction.ARC_END)
-        elif "book_complete" in lower:
-            actions.append(HintAction.BOOK_COMPLETE)
-        elif "new_volume_required" in lower:
-            actions.append(HintAction.NEW_VOLUME_REQUIRED)
-        elif "expand_arc_required" in lower:
-            actions.append(HintAction.EXPAND_ARC_REQUIRED)
-        elif "全部完成" in hint or "完成重写" in hint or "完成打磨" in hint:
-            actions.append(HintAction.REWRITE_DONE)
-        else:
-            actions.append(HintAction.UNKNOWN)
-    return actions
-
-
-def _needs_review_from_actions(commit_res: dict[str, Any], actions: list[HintAction]) -> bool:
-    if commit_res.get("review_required"):
-        return True
-    return HintAction.REVIEW_REQUIRED in actions
-
-
-def _has_placeholder_action(actions: list[HintAction]) -> bool:
-    return any(a in {HintAction.ARC_END, HintAction.BOOK_COMPLETE, HintAction.NEW_VOLUME_REQUIRED, HintAction.EXPAND_ARC_REQUIRED} for a in actions)
-
-
-def _generate_longform_outline_payload(
-    client: OpenAICompatClient,
-    assets: Any,
-    planning_tier: str,
-    chapter: int,
-    mode: str,
-) -> dict[str, Any]:
-    system_prompt = select_architect_prompt(assets, planning_tier)
-    if not system_prompt:
-        system_prompt = "你是小说规划助手，只输出 JSON。"
-    if mode == "append_volume":
-        prompt = f"请为当前故事追加下一卷规划，严格输出 JSON 对象，字段：index,title,theme,final,arcs。arcs 内每项包括 index,title,goal,estimated_chapters,chapters。请至少让第一弧包含详细 chapters。当前章节：{chapter}。"
-        raw = client.complete(system_prompt, prompt, temperature=0.4)
-        import json
-        return json.loads(raw)
-    prompt = f"请为当前故事展开下一弧，严格输出 JSON 数组。每个元素字段：chapter,title,core_event,hook,scenes。当前章节：{chapter}。"
-    raw = client.complete(system_prompt, prompt, temperature=0.4)
-    import json
-    return {"chapters": json.loads(raw)}
-
-
-def _run_longform_hint_actions(
-    client: OpenAICompatClient,
-    runner: AgentRunner,
-    emit_event: Callable[[Event], None],
-    assets: Any,
-    planning_tier: str,
-    chapter: int,
-    actions: list[HintAction],
-    out_lines: list[str],
-) -> None:
-    if HintAction.ARC_END in actions:
-        emit_event(Event(time=datetime.now(), category="TOOL", summary=f"执行 arc_end 后续动作 (ch{chapter})", level="info"))
-        runner.call_tool(
-            "save_arc_summary",
-            {
-                "volume": 1,
-                "arc": max(1, chapter // 3),
-                "title": f"第{max(1, chapter // 3)}弧",
-                "summary": f"到第{chapter}章的弧总结",
-                "key_events": [f"第{chapter-2}~{chapter}章关键推进"],
-                "character_snapshots": [{"name": "主角", "status": "仍在追查", "power": "稳步提升", "motivation": "查清真相", "relations": "与同伴建立基础信任"}],
-                "style_rules": {"prose": ["保持紧凑节奏", "场景切换时保留因果衔接", "每章保留明确钩子"], "dialogue": [{"name": "主角", "rules": ["短句为主", "关键处直陈目标"]}], "taboos": ["避免重复解释已知设定"]},
-            },
-        )
-        out_lines.append("[hint-actions] arc_end -> save_arc_summary")
-    if HintAction.BOOK_COMPLETE in actions:
-        out_lines.append("[hint-actions] book_complete -> 已到达收尾阶段")
-        if chapter % 6 == 0:
-            runner.call_tool(
-                "save_volume_summary",
-                {
-                    "volume": 1,
-                    "title": "第一卷",
-                    "summary": f"到第{chapter}章的卷总结",
-                    "key_events": ["主线建立", "冲突升级", "阶段性转折"],
-                },
-            )
-            out_lines.append("[hint-actions] book_complete -> save_volume_summary")
-    if HintAction.NEW_VOLUME_REQUIRED in actions:
-        emit_event(Event(time=datetime.now(), category="TOOL", summary=f"执行 new_volume_required 规划 (ch{chapter})", level="info"))
-        payload = _generate_longform_outline_payload(client, assets, planning_tier, chapter, "append_volume")
-        runner.call_tool("save_foundation", {"type": "append_volume", "content": payload})
-        out_lines.append("[hint-actions] new_volume_required -> save_foundation append_volume")
-    if HintAction.EXPAND_ARC_REQUIRED in actions:
-        emit_event(Event(time=datetime.now(), category="TOOL", summary=f"执行 expand_arc_required 规划 (ch{chapter})", level="info"))
-        payload = _generate_longform_outline_payload(client, assets, planning_tier, chapter, "expand_arc")
-        runner.call_tool("save_foundation", {"type": "expand_arc", "volume": 1, "arc": max(1, chapter // 3) + 1, "content": payload.get("chapters", [])})
-        out_lines.append("[hint-actions] expand_arc_required -> save_foundation expand_arc")
-
-
 def _generate_review_payload(client: OpenAICompatClient, runner: AgentRunner, chapter: int) -> dict[str, Any]:
     context = runner.call_tool("novel_context", {"chapter": chapter})
     draft_read = runner.call_tool("read_chapter", {"chapter": chapter, "source": "draft"})
@@ -645,50 +512,14 @@ def _run_review_summary(
     review_res = runner.call_tool("save_review", review_payload)
     out_lines.append(f"[tool] save_review -> final_verdict={review_res.get('final_verdict', '')}")
 
-    emit_event(Event(time=datetime.now(), category="TOOL", summary=f"调用 save_arc_summary (ch{chapter})", level="info"))
-    runner.call_tool(
-        "save_arc_summary",
-        {
-            "volume": 1,
-            "arc": max(1, chapter // 3),
-            "title": f"第{max(1, chapter // 3)}弧",
-            "summary": f"到第{chapter}章的弧总结",
-            "key_events": [f"第{chapter-2}~{chapter}章关键推进"],
-            "character_snapshots": [
-                {
-                    "name": "主角",
-                    "status": "仍在追查",
-                    "power": "稳步提升",
-                    "motivation": "查清真相",
-                    "relations": "与同伴建立基础信任",
-                }
-            ],
-            "style_rules": {
-                "prose": ["保持紧凑节奏", "场景切换时保留因果衔接", "每章保留明确钩子"],
-                "dialogue": [{"name": "主角", "rules": ["短句为主", "关键处直陈目标"]}],
-                "taboos": ["避免重复解释已知设定"],
-            },
-        },
-    )
-
-    if chapter % 6 == 0:
-        emit_event(Event(time=datetime.now(), category="TOOL", summary=f"调用 save_volume_summary (ch{chapter})", level="info"))
-        runner.call_tool(
-            "save_volume_summary",
-            {
-                "volume": 1,
-                "title": "第一卷",
-                "summary": f"到第{chapter}章的卷总结",
-                "key_events": ["主线建立", "冲突升级", "阶段性转折"],
-            },
-        )
-
+    save_arc_summary_followup(runner, emit_event, chapter, out_lines)
+    save_volume_summary_followup(runner, emit_event, chapter, out_lines)
     return review_res
 
 
 @dataclass
 class CoordinatorLoop:
-    backend: CoordinatorBackend
+    backend: OrchestratorBackend
 
     def start(self, prompt: str) -> None:
         self.backend.start(prompt)
