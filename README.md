@@ -4,7 +4,7 @@
 
 当前项目默认使用 **LangGraph** 作为编排后端，同时保留 **imperative fallback** 作为兼容与回退路径。系统采用 **tool-driven workflow + file-based persistence** 设计：核心业务动作由 tools 执行，运行状态与中间结果落盘到本地文件，因此支持 resume、checkpoint、review/rewrite 队列和运行过程回放。
 
-![img](img/1.png)
+![img](img/1.jpg)
 
 ## 1. 项目定位
 
